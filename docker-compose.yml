@@ -1,0 +1,16 @@
+services:
+  web:
+    build: .
+    container_name: local-pv-scheduler
+    ports:
+      - "5000:5000"
+    volumes:
+      # SQLite 数据持久化到宿主机命名卷
+      - sched_data:/app/data
+    environment:
+      SCHED_DB_PATH: /app/data/sched.db
+      SECRET_KEY: local-drill-secret-key
+    restart: unless-stopped
+
+volumes:
+  sched_data:

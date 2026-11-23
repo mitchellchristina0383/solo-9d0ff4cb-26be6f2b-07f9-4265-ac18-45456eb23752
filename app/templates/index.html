@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kubernetes 本地卷调度演练</title>
+  <style>
+    :root { --border: #d0d7de; --bg: #f6f8fa; --ok: #1a7f37; --err: #cf222e; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+           margin: 0; padding: 24px; background: var(--bg); color: #1f2328; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 0 0 12px; }
+    .sub { color: #57606a; font-size: 13px; margin-bottom: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 16px; }
+    .card { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .card.full { grid-column: 1 / -1; }
+    label { display: block; font-size: 13px; font-weight: 600; margin: 8px 0 4px; }
+    input[type=text], input[type=number] {
+      width: 100%; padding: 7px 10px; border: 1px solid var(--border);
+      border-radius: 6px; font-size: 14px; }
+    .hint { font-size: 12px; color: #57606a; margin-top: 3px; }
+    button { margin-top: 12px; padding: 8px 16px; border: 0; border-radius: 6px;
+             background: #0969da; color: #fff; font-size: 14px; cursor: pointer; }
+    button:hover { background: #0860c4; }
+    button.danger { background: #cf222e; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+    th { background: var(--bg); font-weight: 600; white-space: nowrap; }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+    .tag.node { background: #ddf4ff; color: #0969da; }
+    .tag.ok { background: #dafbe1; color: var(--ok); }
+    .tag.fail { background: #ffebe9; color: var(--err); }
+    .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;
+             white-space: pre-wrap; word-break: break-all; }
+    .flash.success { background: #dafbe1; border: 1px solid #aceebb; color: var(--ok); }
+    .flash.error { background: #ffebe9; border: 1px solid #ffabaf; color: var(--err); }
+    .muted { color: #57606a; }
+    .empty { color: #8c959f; font-size: 13px; padding: 8px 0; }
+    form.inline { display: inline; }
+  </style>
+</head>
+<body>
+  <h1>Kubernetes 本地卷调度演练</h1>
+  <div class="sub">Flask + SQLite ｜ 本地 PV 带节点与容量，PVC 带申请容量 ｜ 调度事务 BEGIN IMMEDIATE + UNIQUE 约束防并发重复绑定 ｜ 容量单位 GiB</div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+      <div class="flash {{ category }}">{{ message }}</div>
+    {% endfor %}
+  {% endwith %}
+
+  <div class="grid">
+    <!-- 录入 PV -->
+    <div class="card">
+      <h2>① 录入本地 PV（带节点）</h2>
+      <form method="post" action="{{ url_for('create_pv') }}">
+        <label>PV 名称</label>
+        <input type="text" name="name" placeholder="如 pv-node-a-1" required>
+        <label>所在节点</label>
+        <input type="text" name="node" placeholder="如 node-a" required>
+        <label>容量（GiB）</label>
+        <input type="number" name="capacity_gib" min="1" step="1" placeholder="如 10" required>
+        <button type="submit">添加 PV</button>
+      </form>
+    </div>
+
+    <!-- 录入 PVC -->
+    <div class="card">
+      <h2>② 录入待用 PVC</h2>
+      <form method="post" action="{{ url_for('create_pvc') }}">
+        <label>PVC 名称</label>
+        <input type="text" name="name" placeholder="如 pvc-data-1" required>
+        <label>申请容量（GiB）</label>
+        <input type="number" name="request_gib" min="1" step="1" placeholder="如 8" required>
+        <button type="submit">添加 PVC</button>
+      </form>
+    </div>
+
+    <!-- Pod 调度 -->
+    <div class="card">
+      <h2>③ 为 Pod 提交调度</h2>
+      <form method="post" action="{{ url_for('schedule') }}">
+        <label>Pod 名称</label>
+        <input type="text" name="pod_name" placeholder="如 web-0">
+        <label>候选节点（逗号分隔，按顺序尝试）</label>
+        <input type="text" name="candidate_nodes" placeholder="如 node-a, node-b" required>
+        <label>所需 PVC</label>
+        {% if pvcs %}
+          {% for pvc in pvcs %}
+            <label style="font-weight:400">
+              <input type="checkbox" name="required_pvcs" value="{{ pvc.name }}"
+                     style="width:auto; margin-right:6px">{{ pvc.name }}
+              <span class="muted">（申请 {{ pvc.request_gib }} GiB）</span>
+            </label>
+          {% endfor %}
+          <div class="hint">勾选多个 PVC；已绑定的 PVC 会强制 Pod 去往其卷所在节点。</div>
+        {% else %}
+          <div class="empty">暂无 PVC，请先在上方录入。</div>
+        {% endif %}
+        <button type="submit">提交调度</button>
+      </form>
+    </div>
+
+    <!-- 清空 -->
+    <div class="card">
+      <h2>④ 重置演练数据</h2>
+      <p class="hint">清空全部 PV、PVC、绑定关系与调度记录，恢复初始空库（不可恢复）。</p>
+      <form method="post" action="{{ url_for('reset') }}" class="inline"
+            onsubmit="return confirm('确认清空全部演练数据？');">
+        <button type="submit" class="danger">清空重置</button>
+      </form>
+    </div>
+
+    <!-- PV 列表 -->
+    <div class="card full">
+      <h2>本地 PV 清单（共 {{ pvs|length }} 个）</h2>
+      {% if pvs %}
+      <table>
+        <thead><tr><th>PV</th><th>节点</th><th>容量 (GiB)</th><th>状态</th><th>绑定的 PVC</th></tr></thead>
+        <tbody>
+          {% set bound_pv = {} %}
+          {% for b in bindings %}{% set _ = bound_pv.update({b.pv_id: b}) %}{% endfor %}
+          {% for pv in pvs %}
+          <tr>
+            <td>{{ pv.name }}</td>
+            <td><span class="tag node">{{ pv.node }}</span></td>
+            <td>{{ pv.capacity_gib }}</td>
+            <td>
+              {% if pv.id in bound_pv %}<span class="tag fail">已占用</span>
+              {% else %}<span class="tag ok">空闲</span>{% endif %}
+            </td>
+            <td>{{ bound_pv[pv.id].pvc_name if pv.id in bound_pv else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">暂无 PV。</div>{% endif %}
+    </div>
+
+    <!-- PVC 列表 -->
+    <div class="card full">
+      <h2>PVC 清单（共 {{ pvcs|length }} 个）</h2>
+      {% if pvcs %}
+      <table>
+        <thead><tr><th>PVC</th><th>申请 (GiB)</th><th>状态</th><th>绑定的 PV</th><th>所在节点</th></tr></thead>
+        <tbody>
+          {% set bound_pvc = {} %}
+          {% for b in bindings %}{% set _ = bound_pvc.update({b.pvc_id: b}) %}{% endfor %}
+          {% for pvc in pvcs %}
+          <tr>
+            <td>{{ pvc.name }}</td>
+            <td>{{ pvc.request_gib }}</td>
+            <td>
+              {% if pvc.id in bound_pvc %}<span class="tag fail">已绑定</span>
+              {% else %}<span class="tag ok">待绑定</span>{% endif %}
+            </td>
+            <td>{{ bound_pvc[pvc.id].pv_name if pvc.id in bound_pvc else '—' }}</td>
+            <td>{{ bound_pvc[pvc.id].pv_node if pvc.id in bound_pvc else '—' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">暂无 PVC。</div>{% endif %}
+    </div>
+
+    <!-- 绑定关系 -->
+    <div class="card full">
+      <h2>当前绑定关系（共 {{ bindings|length }} 条）</h2>
+      {% if bindings %}
+      <table>
+        <thead><tr><th>#</th><th>PVC</th><th>申请 (GiB)</th><th>PV</th><th>卷容量 (GiB)</th><th>节点</th><th>来源调度 #</th><th>绑定时间</th></tr></thead>
+        <tbody>
+          {% for b in bindings %}
+          <tr>
+            <td>{{ b.id }}</td>
+            <td>{{ b.pvc_name }}</td>
+            <td>{{ b.request_gib }}</td>
+            <td>{{ b.pv_name }}</td>
+            <td>{{ b.capacity_gib }}</td>
+            <td><span class="tag node">{{ b.pv_node }}</span></td>
+            <td>{{ b.run_id }}</td>
+            <td>{{ b.created_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">暂无绑定。</div>{% endif %}
+    </div>
+
+    <!-- 调度历史 -->
+    <div class="card full">
+      <h2>调度提交记录（最近 20 条）</h2>
+      {% if runs %}
+      <table>
+        <thead><tr><th>#</th><th>Pod</th><th>候选节点</th><th>所需 PVC</th><th>结果</th><th>选定节点</th><th>说明</th><th>时间</th></tr></thead>
+        <tbody>
+          {% for r in runs %}
+          <tr>
+            <td>{{ r.id }}</td>
+            <td>{{ r.pod_name }}</td>
+            <td>{{ r.candidate_nodes }}</td>
+            <td>{{ r.required_pvcs }}</td>
+            <td>
+              {% if r.status == 'success' %}<span class="tag ok">成功</span>
+              {% else %}<span class="tag fail">失败</span>{% endif %}
+            </td>
+            <td>{{ r.selected_node or '—' }}</td>
+            <td>{{ r.message }}</td>
+            <td>{{ r.created_at }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">暂无调度记录。</div>{% endif %}
+    </div>
+  </div>
+</body>
+</html>

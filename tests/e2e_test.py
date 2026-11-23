@@ -10,6 +10,10 @@
      - 同一 PVC 并发提交只绑定一次
      - 不同 PVC 并发抢同一批 PV：每个 PV 只分给一个 PVC
      - 多 PVC Pod 并发：整笔事务原子，不出现半套绑定
+  C. 节点空闲卷盘点（按卷名分页，每页最多 50 条）
+     - 范围以打开第一页时已登记且空闲的卷为准，一轮翻完不重不漏
+     - 中途新录入的卷留到下一轮；中途被占用的卷仍在原位置并显示占用它的 PVC
+     - 翻页期间照常录卷和调度；网页与 JSON 视图一致
 用法：python tests/e2e_test.py [base_url]
 """
 import json
@@ -46,6 +50,38 @@ def post(path, data):
 def get_state():
     with urllib.request.urlopen(BASE + "/state", timeout=10) as resp:
         return json.loads(resp.read().decode())
+
+
+def get_raw(path):
+    """GET 请求，不跟随 302，返回 (status, body)。"""
+    req = urllib.request.Request(BASE + path, method="GET")
+    try:
+        with _OPENER.open(req, timeout=30) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def get_inventory(params):
+    """盘点 JSON 视图：params 为首轮 {"node": ...} 或上一页返回的 next_params。"""
+    qs = dict(params)
+    qs["format"] = "json"
+    with urllib.request.urlopen(
+        BASE + "/inventory?" + urlencode(qs), timeout=30
+    ) as resp:
+        return json.loads(resp.read().decode())
+
+
+def fetch_round(first_params):
+    """跟随 next_params 翻完整轮盘点，返回页列表。"""
+    pages = []
+    params = first_params
+    while True:
+        page = get_inventory(params)
+        pages.append(page)
+        if not page["has_next"]:
+            return pages
+        params = page["next_params"]
 
 
 def check(name, cond, detail=""):
@@ -327,6 +363,114 @@ check("全库恰好 1 条绑定，唯一 PV 只分给一个 PVC",
 check("1 成功 11 失败",
       len([r for r in st["runs"] if r["status"] == "success"]) == 1
       and len([r for r in st["runs"] if r["status"] == "failed"]) == 11)
+
+# --------------------------------------------------------------------------- #
+section("C1. 盘点数据准备：inv-a 120 卷（3 卷容量特殊）、inv-b 3 卷（含中文名）")
+post("/reset", {})
+special = {5: 9, 50: 10, 70: 7}          # 用于定点绑定的特殊容量
+for i in range(1, 121):
+    add_pv(f"inv-a-{i:04d}", "inv-a", special.get(i, 5))
+for name in ["inv-b-1", "inv-b-2", "卷-甲"]:
+    add_pv(name, "inv-b", 5)
+# 第一页打开前就被占用的两卷：pvc-pre-9→inv-a-0005(9Gi)、pvc-pre-10→inv-a-0050(10Gi)
+add_pvc("pvc-pre-9", 9)
+add_pvc("pvc-pre-10", 10)
+schedule("pod-pre-9", "inv-a", ["pvc-pre-9"])
+schedule("pod-pre-10", "inv-a", ["pvc-pre-10"])
+st = get_state()
+b = binding_map(st)
+check("定点绑定成功：pvc-pre-9→inv-a-0005、pvc-pre-10→inv-a-0050",
+      b.get("pvc-pre-9", {}).get("pv_name") == "inv-a-0005"
+      and b.get("pvc-pre-10", {}).get("pv_name") == "inv-a-0050",
+      str([(x["pvc_name"], x["pv_name"]) for x in st["bindings"]]))
+
+section("C2. 打开第一页：50 条、范围水位确定；随后翻页期间照常录卷和调度")
+r1_pages = [get_inventory({"node": "inv-a"})]
+r1_scope = r1_pages[0]["scope"]
+check("第一页 50 条、还有下一页",
+      r1_pages[0]["count"] == 50 and r1_pages[0]["has_next"] is True
+      and r1_pages[0]["page"] == 1)
+check("范围水位已圈定（pv/binding 高水位均 > 0）",
+      r1_scope["pv_highwater"] > 0 and r1_scope["binding_highwater"] > 0,
+      str(r1_scope))
+# 翻页期间中途变化：新录 3 卷（分别落在已翻过/中间/未到的位置）+ 绑定 1 卷
+add_pv("inv-a-0000", "inv-a", 5)         # 名字排在最前（已翻过的区域）
+add_pv("inv-a-00605", "inv-a", 5)        # 名字插在未翻到的页中间
+add_pv("inv-a-0130", "inv-a", 5)         # 名字排在最后
+add_pvc("pvc-mid-7", 7)
+code, _ = schedule("pod-mid", "inv-a", ["pvc-mid-7"])
+st = get_state()
+check("翻页期间照常调度：pvc-mid-7 绑到 inv-a-0070（7Gi 最小适配）",
+      code == 302
+      and binding_map(st).get("pvc-mid-7", {}).get("pv_name") == "inv-a-0070",
+      str(binding_map(st).get("pvc-mid-7")))
+
+section("C3. 继续翻完本轮：中途新录入的卷不出现，被占用的卷仍在原位置")
+params = r1_pages[0]["next_params"]
+while params is not None:
+    r1_pages.append(get_inventory(params))
+    params = r1_pages[-1]["next_params"]
+counts = [p["count"] for p in r1_pages]
+check("共 3 页，每页 ≤ 50 条（50/50/18）",
+      counts == [50, 50, 18] and all(c <= 50 for c in counts), str(counts))
+check("各页范围水位一致（同一轮）",
+      all(p["scope"] == r1_scope for p in r1_pages))
+names1 = [it["name"] for p in r1_pages for it in p["items"]]
+expected1 = {f"inv-a-{i:04d}" for i in range(1, 121)} - {"inv-a-0005", "inv-a-0050"}
+check("一轮 118 条不重不漏（全集 = 120 - 2 个事先占用）",
+      len(names1) == len(set(names1)) == 118 and set(names1) == expected1,
+      f"got {len(names1)} unique {len(set(names1))}")
+check("整轮按卷名严格升序", names1 == sorted(names1))
+check("中途新录入的 3 卷留到下轮（本轮任何页都不出现）",
+      not ({"inv-a-0000", "inv-a-00605", "inv-a-0130"} & set(names1)))
+mid = next((it for p in r1_pages for it in p["items"]
+            if it["name"] == "inv-a-0070"), None)
+check("中途被占用的 inv-a-0070 仍在原位置（第 2 页按名序）并显示占用 PVC",
+      mid is not None and mid["status"] == "occupied"
+      and mid["pvc_name"] == "pvc-mid-7"
+      and r1_pages[1]["items"] and
+      any(it["name"] == "inv-a-0070" for it in r1_pages[1]["items"]),
+      str(mid))
+check("其余各卷状态均为空闲",
+      all(it["status"] == "free" for p in r1_pages for it in p["items"]
+          if it["name"] != "inv-a-0070"))
+
+section("C4. 重新开始一轮：上轮的占用卷退出范围，中途新录入的卷进入范围")
+r2_pages = fetch_round({"node": "inv-a"})
+names2 = [it["name"] for p in r2_pages for it in p["items"]]
+expected2 = (expected1 | {"inv-a-0000", "inv-a-00605", "inv-a-0130"}) - {"inv-a-0070"}
+check("第二轮 120 条不重不漏（+3 新录入 -1 上轮中途被占用）",
+      len(names2) == len(set(names2)) == 120 and set(names2) == expected2,
+      f"got {len(names2)}")
+check("第二轮每页 ≤ 50 条且全部空闲",
+      all(p["count"] <= 50 for p in r2_pages)
+      and all(it["status"] == "free" for p in r2_pages for it in p["items"]))
+check("两轮水位不同（新一轮重新圈定）",
+      r2_pages[0]["scope"]["pv_highwater"] > r1_scope["pv_highwater"])
+
+section("C5. 其他节点与边界：inv-b 一轮 3 卷（含中文名）、空节点、非法参数")
+rb = fetch_round({"node": "inv-b"})
+names_b = [it["name"] for p in rb for it in p["items"]]
+check("inv-b 单页 3 卷、无下一页、含中文卷名",
+      len(rb) == 1 and rb[0]["count"] == 3 and rb[0]["has_next"] is False
+      and set(names_b) == {"inv-b-1", "inv-b-2", "卷-甲"}, str(names_b))
+re_ = get_inventory({"node": "inv-c"})
+check("无卷节点：0 条、无下一页", re_["count"] == 0 and re_["has_next"] is False)
+code, _ = get_raw("/inventory")
+check("未选节点 → 302 回首页", code == 302, f"code={code}")
+code, _ = get_raw("/inventory?node=inv-a&pvw=abc&bdw=1")
+check("非法水位参数 → 302 重新开始本轮", code == 302, f"code={code}")
+
+section("C6. 网页自测：首页盘点入口与盘点页渲染、翻页链接携带水位与游标")
+code, body = get_raw("/")
+check("首页 200，含盘点入口与节点下拉",
+      code == 200 and "节点空闲卷盘点" in body and 'name="node"' in body)
+code, body = get_raw("/inventory?node=inv-a")
+check("盘点第一页 200，含卷明细行与「下一页」链接（带水位 pvw/bdw 与游标 after）",
+      code == 200 and 'data-pv="inv-a-0000"' in body
+      and "下一页" in body and "pvw=" in body and "bdw=" in body and "after=" in body)
+check("第一页恰含 50 行卷明细", body.count("data-pv=") == 50,
+      f"rows={body.count('data-pv=')}")
 
 print("\n========================================")
 print(f"断言通过 {PASS} / 失败 {FAIL}")

@@ -8,7 +8,15 @@
    - 对每个候选节点，尝试用该节点上仍空闲、且容量足够的 PV 满足全部未绑定 PVC
      （降序贪心 + 最小适配），只要有一个候选节点可行即选定该节点并落库新绑定。
    - 所有候选节点都凑不齐 → 说明卡点，保留原有绑定，本次不新增任何绑定。
-3. 并发安全：
+3. 节点空闲卷盘点（/inventory，检修节点前的逐卷核对）：
+   - 值班员选定节点后按卷名翻页，每页最多 50 条；
+   - 盘点范围以打开第一页时该节点已登记且空闲的卷为准，用 pv / binding
+     两个高水位 id 圈定（一条 SELECT 读取，不复制整份清单）；
+   - 中途新录入的卷（id 大于水位）留到下一轮；原先空闲、中途被占用的卷
+     仍在清单原位置列出，并显示占用它的 PVC；
+   - 每页明细与占用状态来自同一条 SELECT 的已提交快照，
+     不跨请求保留读事务，翻页期间照常录卷和调度。
+4. 并发安全：
    - SQLite 调度事务以 BEGIN IMMEDIATE 开启，提交串行化；
    - binding 表 pv_id / pvc_id 均为 UNIQUE，数据库层面兜底，
      同一 PVC 只绑定一次、同一 PV 只分给一个 PVC。
@@ -34,6 +42,9 @@ SCHEMA_PATH = os.path.join(BASE_DIR, "schema.sql")
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "local-drill-secret-key")
+
+# 盘点每页最多展示的卷明细条数
+INVENTORY_PAGE_SIZE = 50
 
 
 # --------------------------------------------------------------------------- #
@@ -104,11 +115,8 @@ def _rollback_quietly(db):
         pass
 
 
-def _load_snapshot(db):
-    """读取当前 PV / PVC / 绑定 / 最近调度记录，供页面渲染。"""
-    pvs = db.execute(
-        "SELECT * FROM pv ORDER BY node, name"
-    ).fetchall()
+def _load_lists(db):
+    """读取 PVC / 绑定 / 最近调度记录（首页与 /state 共用）。"""
     pvcs = db.execute(
         "SELECT * FROM pvc ORDER BY name"
     ).fetchall()
@@ -126,7 +134,67 @@ def _load_snapshot(db):
     runs = db.execute(
         "SELECT * FROM pod_run ORDER BY id DESC LIMIT 20"
     ).fetchall()
+    return pvcs, bindings, runs
+
+
+def _load_snapshot(db):
+    """读取当前 PV / PVC / 绑定 / 最近调度记录，供 /state 全量快照。"""
+    pvs = db.execute(
+        "SELECT * FROM pv ORDER BY node, name"
+    ).fetchall()
+    pvcs, bindings, runs = _load_lists(db)
     return pvs, pvcs, bindings, runs
+
+
+# --------------------------------------------------------------------------- #
+# 节点空闲卷盘点：高水位圈定范围 + 卷名 keyset 翻页（服务端无状态）
+# --------------------------------------------------------------------------- #
+def _inventory_scope(db, node):
+    """读取本轮盘点范围的高水位：单条 SELECT，两个水位来自同一已提交快照。
+
+    pv 高水位     —— 该节点此刻已登记卷的最大 id（id 自增单调，之后新录入的
+                     卷 id 更大，被范围条件自然排除、留到下一轮）；
+    binding 高水位 —— 此刻已提交绑定的最大 id（调度以 BEGIN IMMEDIATE 串行
+                     提交，id 顺序即提交顺序），用于判定"第一页时已占用"。
+    """
+    row = db.execute(
+        """
+        SELECT (SELECT COALESCE(MAX(id), 0) FROM pv WHERE node = ?) AS pv_hw,
+               (SELECT COALESCE(MAX(id), 0) FROM binding)           AS binding_hw,
+               datetime('now', 'localtime')                         AS since
+        """,
+        (node,),
+    ).fetchone()
+    return row["pv_hw"], row["binding_hw"], row["since"]
+
+
+def _inventory_page(db, node, pv_hw, binding_hw, after):
+    """按卷名游标取一页盘点明细（多取 1 条，用于判断是否还有下一页）。
+
+    范围过滤（整个翻页周期固定不变，保证一轮不重不漏）：
+      p.id <= pv_hw                       —— 只含打开第一页时已登记的卷；
+      NOT EXISTS binding.id <= binding_hw —— 排除第一页时已占用的卷；
+      p.name > after                      —— keyset 游标，卷名 UNIQUE 故全序稳定。
+    当前占用状态由同一条 SELECT 的 LEFT JOIN 读出（一次读取的已提交数据）；
+    中途新产生的绑定（id > binding_hw）不缩小范围，只把该卷标为已占用。
+    """
+    return db.execute(
+        """
+        SELECT p.name, p.capacity_gib, p.created_at,
+               c.name AS pvc_name, b.created_at AS bound_at
+          FROM pv p
+          LEFT JOIN binding b ON b.pv_id = p.id
+          LEFT JOIN pvc c ON c.id = b.pvc_id
+         WHERE p.node = ?
+           AND p.id <= ?
+           AND p.name > ?
+           AND NOT EXISTS (SELECT 1 FROM binding b0
+                            WHERE b0.pv_id = p.id AND b0.id <= ?)
+         ORDER BY p.name
+         LIMIT ?
+        """,
+        (node, pv_hw, after, binding_hw, INVENTORY_PAGE_SIZE + 1),
+    ).fetchall()
 
 
 def _try_node(node, pvc_rows, pv_by_id, bound_by_pvc, bound_pv_ids):
@@ -261,13 +329,119 @@ def _do_schedule(db, pod_name, candidate_nodes, pvc_rows, pv_by_id,
 @app.route("/")
 def index():
     db = get_db()
-    pvs, pvcs, bindings, runs = _load_snapshot(db)
+    pvcs, bindings, runs = _load_lists(db)
+    # 盘点入口的节点汇总：只按节点聚合计数，不全量加载 PV 清单
+    # （卷明细走 /inventory 分页，每页最多 50 条）
+    node_stats = db.execute(
+        """
+        SELECT p.node AS node,
+               COUNT(*) AS total,
+               SUM(CASE WHEN b.pv_id IS NULL THEN 1 ELSE 0 END) AS free
+          FROM pv p
+          LEFT JOIN binding b ON b.pv_id = p.id
+         GROUP BY p.node
+         ORDER BY p.node
+        """
+    ).fetchall()
+    pv_total = sum(row["total"] for row in node_stats)
     return render_template(
         "index.html",
-        pvs=pvs,
         pvcs=pvcs,
         bindings=bindings,
         runs=runs,
+        node_stats=node_stats,
+        pv_total=pv_total,
+    )
+
+
+@app.route("/inventory")
+def inventory():
+    """节点空闲卷盘点：选定节点后按卷名翻页，每页最多 50 条。
+
+    无状态实现：范围高水位与卷名游标都放在翻页链接参数里，服务端不为每轮
+    盘点复制整份清单，也不跨请求保留读事务——每个请求各自执行自己的
+    SELECT，读完即释放。
+    """
+    node = request.args.get("node", "").strip()
+    if not node:
+        flash("请先选择要盘点的节点", "error")
+        return redirect(url_for("index"))
+
+    db = get_db()
+    pvw_raw = request.args.get("pvw")
+    bdw_raw = request.args.get("bdw")
+    if pvw_raw is None or bdw_raw is None:
+        # 第一页：圈定本轮盘点范围（此后各页沿用同一组水位，一轮不重不漏）
+        pv_hw, binding_hw, since = _inventory_scope(db, node)
+        after, page = "", 1
+    else:
+        try:
+            pv_hw = int(pvw_raw)
+            binding_hw = int(bdw_raw)
+            page = max(1, int(request.args.get("page", "1")))
+        except ValueError:
+            flash("盘点链接参数无效，已重新开始本轮盘点", "error")
+            return redirect(url_for("inventory", node=node))
+        after = request.args.get("after", "")
+        since = request.args.get("since", "")
+
+    rows = _inventory_page(db, node, pv_hw, binding_hw, after)
+    has_next = len(rows) > INVENTORY_PAGE_SIZE
+    rows = rows[:INVENTORY_PAGE_SIZE]
+
+    next_params = None
+    if has_next:
+        next_params = {
+            "node": node,
+            "pvw": pv_hw,
+            "bdw": binding_hw,
+            "after": rows[-1]["name"],
+            "page": page + 1,
+            "since": since,
+        }
+
+    items = [
+        {
+            "name": r["name"],
+            "capacity_gib": r["capacity_gib"],
+            "created_at": r["created_at"],
+            "status": "occupied" if r["pvc_name"] is not None else "free",
+            "pvc_name": r["pvc_name"],
+            "bound_at": r["bound_at"],
+        }
+        for r in rows
+    ]
+
+    if request.args.get("format") == "json":
+        # 与网页同一查询逻辑的 JSON 视图，供自动化试跑脚本逐页核对
+        return jsonify(
+            {
+                "node": node,
+                "page": page,
+                "page_size": INVENTORY_PAGE_SIZE,
+                "count": len(items),
+                "has_next": has_next,
+                "scope": {
+                    "pv_highwater": pv_hw,
+                    "binding_highwater": binding_hw,
+                    "since": since,
+                },
+                "next_params": next_params,
+                "items": items,
+            }
+        )
+
+    return render_template(
+        "inventory.html",
+        node=node,
+        items=items,
+        page=page,
+        page_size=INVENTORY_PAGE_SIZE,
+        shown_total=(page - 1) * INVENTORY_PAGE_SIZE + len(items),
+        has_next=has_next,
+        next_url=url_for("inventory", **next_params) if next_params else None,
+        restart_url=url_for("inventory", node=node),
+        since=since,
     )
 
 

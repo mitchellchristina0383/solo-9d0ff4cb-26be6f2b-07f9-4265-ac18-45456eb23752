@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>节点空闲卷盘点 · {{ node }}</title>
+  <style>
+    :root { --border: #d0d7de; --bg: #f6f8fa; --ok: #1a7f37; --err: #cf222e; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+           margin: 0; padding: 24px; background: var(--bg); color: #1f2328; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: #57606a; font-size: 13px; margin-bottom: 16px; }
+    .card { background: #fff; border: 1px solid var(--border); border-radius: 8px;
+            padding: 16px; max-width: 1080px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+    th { background: var(--bg); font-weight: 600; white-space: nowrap; }
+    .tag { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+    .tag.node { background: #ddf4ff; color: #0969da; }
+    .tag.ok { background: #dafbe1; color: var(--ok); }
+    .tag.fail { background: #ffebe9; color: var(--err); }
+    .muted { color: #57606a; }
+    .empty { color: #8c959f; font-size: 13px; padding: 8px 0; }
+    .hint { font-size: 12px; color: #57606a; margin-top: 10px; }
+    .bar { display: flex; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+    a.btn { display: inline-block; padding: 8px 16px; border-radius: 6px; background: #0969da;
+            color: #fff; font-size: 14px; text-decoration: none; }
+    a.btn:hover { background: #0860c4; }
+    a.btn.plain { background: #f6f8fa; color: #1f2328; border: 1px solid var(--border); }
+    a.btn.plain:hover { background: #eef1f4; }
+    .endmark { color: var(--ok); font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>节点空闲卷盘点 · <span class="tag node">{{ node }}</span></h1>
+  <div class="sub">
+    第 {{ page }} 页 ｜ 本页 {{ items|length }} 条（每页最多 {{ page_size }} 条）｜
+    本轮已累计 {{ shown_total }} 条
+    {% if since %}｜ 本轮范围确定于 {{ since }}（打开第一页时刻）{% endif %}
+  </div>
+
+  <div class="card">
+    {% if items %}
+    <table>
+      <thead>
+        <tr><th>#</th><th>PV（按卷名排序）</th><th>容量 (GiB)</th><th>录入时间</th><th>当前状态</th><th>占用它的 PVC</th></tr>
+      </thead>
+      <tbody>
+        {% for it in items %}
+        <tr data-pv="{{ it.name }}">
+          <td class="muted">{{ (page - 1) * page_size + loop.index }}</td>
+          <td>{{ it.name }}</td>
+          <td>{{ it.capacity_gib }}</td>
+          <td>{{ it.created_at }}</td>
+          <td>
+            {% if it.status == 'occupied' %}<span class="tag fail">已占用</span>
+            {% else %}<span class="tag ok">空闲</span>{% endif %}
+          </td>
+          <td>
+            {% if it.pvc_name %}{{ it.pvc_name }}<span class="muted">（{{ it.bound_at }} 绑定）</span>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      {% if page == 1 %}
+      <div class="empty">该节点当前没有已登记且空闲的本地卷（可能全部已被占用，或尚未录入）。</div>
+      {% else %}
+      <div class="empty">本轮盘点在此页之前已翻完，没有更多卷。</div>
+      {% endif %}
+    {% endif %}
+
+    <div class="bar">
+      {% if has_next %}
+      <a class="btn" href="{{ next_url }}">下一页 →</a>
+      {% else %}
+      <span class="endmark">✓ 已到本轮最后一页，盘点范围内无更多卷</span>
+      {% endif %}
+      <a class="btn plain" href="{{ restart_url }}">重新开始本轮盘点</a>
+      <a class="btn plain" href="{{ url_for('index') }}">返回首页</a>
+    </div>
+
+    <p class="hint">
+      盘点范围以打开第一页时该节点已登记且空闲的卷为准，一轮翻完不重不漏。
+      翻页期间可照常录卷和调度：中途新录入的卷不会插入本轮，留到下一轮（点「重新开始本轮盘点」即可看到）；
+      原先空闲、中途被占用的卷仍在原位置列出，并显示占用它的 PVC；
+      同一页的占用状态来自一次读取的已提交数据。
+    </p>
+  </div>
+</body>
+</html>

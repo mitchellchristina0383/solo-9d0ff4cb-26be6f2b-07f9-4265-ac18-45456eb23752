@@ -16,9 +16,9 @@
     .card { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
     .card.full { grid-column: 1 / -1; }
     label { display: block; font-size: 13px; font-weight: 600; margin: 8px 0 4px; }
-    input[type=text], input[type=number] {
+    input[type=text], input[type=number], select {
       width: 100%; padding: 7px 10px; border: 1px solid var(--border);
-      border-radius: 6px; font-size: 14px; }
+      border-radius: 6px; font-size: 14px; background: #fff; }
     .hint { font-size: 12px; color: #57606a; margin-top: 3px; }
     button { margin-top: 12px; padding: 8px 16px; border: 0; border-radius: 6px;
              background: #0969da; color: #fff; font-size: 14px; cursor: pointer; }
@@ -42,7 +42,7 @@
 </head>
 <body>
   <h1>Kubernetes 本地卷调度演练</h1>
-  <div class="sub">Flask + SQLite ｜ 本地 PV 带节点与容量，PVC 带申请容量 ｜ 调度事务 BEGIN IMMEDIATE + UNIQUE 约束防并发重复绑定 ｜ 容量单位 GiB</div>
+  <div class="sub">Flask + SQLite ｜ 本地 PV 带节点与容量，PVC 带申请容量 ｜ 调度事务 BEGIN IMMEDIATE + UNIQUE 约束防并发重复绑定 ｜ 节点空闲卷盘点按卷名分页（每页 ≤50）｜ 容量单位 GiB</div>
 
   {% with messages = get_flashed_messages(with_categories=true) %}
     {% for category, message in messages %}
@@ -112,30 +112,28 @@
       </form>
     </div>
 
-    <!-- PV 列表 -->
+    <!-- 节点空闲卷盘点（分页） -->
     <div class="card full">
-      <h2>本地 PV 清单（共 {{ pvs|length }} 个）</h2>
-      {% if pvs %}
-      <table>
-        <thead><tr><th>PV</th><th>节点</th><th>容量 (GiB)</th><th>状态</th><th>绑定的 PVC</th></tr></thead>
-        <tbody>
-          {% set bound_pv = {} %}
-          {% for b in bindings %}{% set _ = bound_pv.update({b.pv_id: b}) %}{% endfor %}
-          {% for pv in pvs %}
-          <tr>
-            <td>{{ pv.name }}</td>
-            <td><span class="tag node">{{ pv.node }}</span></td>
-            <td>{{ pv.capacity_gib }}</td>
-            <td>
-              {% if pv.id in bound_pv %}<span class="tag fail">已占用</span>
-              {% else %}<span class="tag ok">空闲</span>{% endif %}
-            </td>
-            <td>{{ bound_pv[pv.id].pvc_name if pv.id in bound_pv else '—' }}</td>
-          </tr>
+      <h2>⑤ 节点空闲卷盘点（共 {{ pv_total }} 个本地卷，分布在 {{ node_stats|length }} 个节点）</h2>
+      <p class="hint">
+        检修节点前逐卷核对：选定节点后按卷名翻页，每页最多 50 条。
+        盘点范围以打开第一页时该节点<b>已登记且空闲</b>的卷为准，一轮翻完不重不漏；
+        翻页期间照常录卷和调度——中途新录入的卷自动留到下一轮，
+        原先空闲、中途被占用的卷仍在原位置列出并显示占用它的 PVC。
+      </p>
+      {% if node_stats %}
+      <form method="get" action="{{ url_for('inventory') }}">
+        <label>选择要盘点的节点</label>
+        <select name="node">
+          {% for ns in node_stats %}
+          <option value="{{ ns.node }}">{{ ns.node }}（空闲 {{ ns.free }} / 共 {{ ns.total }} 卷）</option>
           {% endfor %}
-        </tbody>
-      </table>
-      {% else %}<div class="empty">暂无 PV。</div>{% endif %}
+        </select>
+        <button type="submit">开始盘点（打开第一页）</button>
+      </form>
+      {% else %}
+      <div class="empty">暂无 PV，请先在上方录入。</div>
+      {% endif %}
     </div>
 
     <!-- PVC 列表 -->
